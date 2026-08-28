@@ -40,6 +40,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -161,7 +162,7 @@ func IsTokenAboutToExpire(token string) bool {
 
 // CacheRefreshedToken updates the refresh token in the cache.
 func CacheRefreshedToken(token *oauth2.Token, tokenType string, oldToken string,
-	oldRefreshToken string, cache cache.Cache[interface{}],
+	cache cache.Cache[interface{}],
 ) error {
 	newToken, ok := token.Extra(tokenType).(string)
 	if !ok {
@@ -175,7 +176,7 @@ func CacheRefreshedToken(token *oauth2.Token, tokenType string, oldToken string,
 		return err
 	}
 
-	if err := cache.SetWithTTL(ctx, oidcKeyPrefix+oldToken, oldRefreshToken, oldTokenTTL); err != nil {
+	if err := cache.SetWithTTL(ctx, oidcKeyPrefix+oldToken, token, oldTokenTTL); err != nil {
 		logger.Log(logger.LevelError, nil, err, "failed to cache refreshed token")
 		return err
 	}
@@ -193,6 +194,10 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 	refreshToken, err := cache.Get(ctx, oidcKeyPrefix+token)
 	if err != nil {
 		return nil, fmt.Errorf("getting refresh token: %w", err)
+	}
+
+	if refreshedToken, ok := refreshToken.(*oauth2.Token); ok {
+		return refreshedToken, nil
 	}
 
 	rToken, ok := refreshToken.(string)
@@ -216,7 +221,7 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 	}
 
 	// update the refresh token in the cache
-	if err := CacheRefreshedToken(newToken, tokenType, token, rToken, cache); err != nil {
+	if err := CacheRefreshedToken(newToken, tokenType, token, cache); err != nil {
 		return nil, fmt.Errorf("caching refreshed token: %w", err)
 	}
 
@@ -594,11 +599,38 @@ type RefreshAndSetTokenParams struct {
 	OIDCValidatorIdpIssuerURL string
 	BaseURL                   string
 	SessionTTL                int
+	Coordinator               *TokenRefreshCoordinator
+}
+
+// TokenRefreshCoordinator coalesces refreshes for requests carrying the same
+// expiring token. Providers that rotate refresh tokens must receive only one
+// exchange for that credential.
+type TokenRefreshCoordinator struct {
+	group singleflight.Group
+}
+
+func (c *TokenRefreshCoordinator) refresh(
+	key string,
+	refresh func() (*oauth2.Token, error),
+) (*oauth2.Token, error) {
+	result, err, _ := c.group.Do(key, func() (interface{}, error) {
+		return refresh()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	refreshedToken, ok := result.(*oauth2.Token)
+	if !ok || refreshedToken == nil {
+		return nil, errors.New("token refresh returned no token")
+	}
+
+	return refreshedToken, nil
 }
 
 // RefreshAndSetToken refreshes an expiring token, updates the auth cookie,
 // and records telemetry based on the provided parameters.
-func RefreshAndSetToken(params RefreshAndSetTokenParams) {
+func RefreshAndSetToken(params RefreshAndSetTokenParams) error {
 	// The token type to use
 	tokenType := "id_token"
 	if params.OIDCUseAccessToken {
@@ -610,43 +642,72 @@ func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 		idpIssuerURL = params.OIDCAuthConfig.IdpIssuerURL
 	}
 
-	newToken, err := RefreshAndCacheNewToken(
-		params.Ctx,
-		params.OIDCAuthConfig,
-		params.Cache,
-		tokenType,
-		params.Token,
-		idpIssuerURL,
-		params.OIDCValidatorIdpIssuerURL,
-	)
+	newToken, err := refreshToken(params, tokenType, idpIssuerURL)
 	if err != nil {
 		logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
 			err, "failed to refresh token")
 		params.TelemetryHandler.RecordError(params.Span, err, "Token refresh failed")
 		params.TelemetryHandler.RecordErrorCount(params.Ctx, attribute.String("error", "token_refresh_failure"))
-	} else if newToken != nil {
-		var newTokenString string
 
-		var ok bool
-
-		if params.OIDCUseAccessToken {
-			newTokenString, ok = newToken.Extra("access_token").(string)
-		} else {
-			newTokenString, ok = newToken.Extra("id_token").(string)
-		}
-
-		if !ok || newTokenString == "" {
-			logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
-				errors.New("refreshed token missing expected field"), "failed to extract token string")
-			params.TelemetryHandler.RecordError(params.Span,
-				errors.New("refreshed token missing expected field"), "Token extraction failed")
-
-			return
-		}
-
-		// Set refreshed token in cookie
-		SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
-
-		params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
+		return err
 	}
+
+	if newToken == nil {
+		return errors.New("token refresh returned no token")
+	}
+
+	newTokenString, ok := refreshedTokenString(newToken, params.OIDCUseAccessToken)
+
+	if !ok || newTokenString == "" {
+		extractErr := errors.New("refreshed token missing expected field")
+		logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
+			extractErr, "failed to extract token string")
+		params.TelemetryHandler.RecordError(params.Span,
+			extractErr, "Token extraction failed")
+
+		return extractErr
+	}
+
+	SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
+
+	params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
+
+	return nil
+}
+
+func refreshToken(
+	params RefreshAndSetTokenParams,
+	tokenType string,
+	idpIssuerURL string,
+) (*oauth2.Token, error) {
+	refresh := func() (*oauth2.Token, error) {
+		return RefreshAndCacheNewToken(
+			params.Ctx,
+			params.OIDCAuthConfig,
+			params.Cache,
+			tokenType,
+			params.Token,
+			idpIssuerURL,
+			params.OIDCValidatorIdpIssuerURL,
+		)
+	}
+
+	if params.Coordinator == nil {
+		return refresh()
+	}
+
+	refreshKey := idpIssuerURL + "\x00" + params.OIDCAuthConfig.ClientID + "\x00" + params.Token
+
+	return params.Coordinator.refresh(refreshKey, refresh)
+}
+
+func refreshedTokenString(token *oauth2.Token, useAccessToken bool) (string, bool) {
+	if useAccessToken {
+		value, ok := token.Extra("access_token").(string)
+		return value, ok
+	}
+
+	value, ok := token.Extra("id_token").(string)
+
+	return value, ok
 }

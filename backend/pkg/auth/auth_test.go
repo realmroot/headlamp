@@ -29,6 +29,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -522,7 +523,7 @@ func TestCacheRefreshedToken_Success(t *testing.T) {
 	fc := &fakeCache{}
 	tok := tokenWithExtra("id_token", "NEW")
 
-	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", "REFRESH_OLD", fc)
+	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", fc)
 	if err != nil {
 		t.Fatalf("CacheRefreshedToken() unexpected error: %v", err)
 	}
@@ -548,9 +549,7 @@ func TestCacheRefreshedToken_Success(t *testing.T) {
 		t.Errorf("old token key = %q, want %q", call.key, "oidc-token-OLD")
 	}
 
-	if call.val != "REFRESH_OLD" {
-		t.Errorf("old token value = %v, want %v", call.val, "REFRESH_OLD")
-	}
+	assert.Same(t, tok, call.val)
 
 	if call.ttl != 10*time.Second {
 		t.Errorf("ttl = %v, want %v", call.ttl, 10*time.Second)
@@ -561,7 +560,7 @@ func TestCacheRefreshedToken_NoExtra_NoOp(t *testing.T) {
 	fc := &fakeCache{}
 	tok := tokenWithExtra("", "") // no extra set → Extra(tokenType) not ok
 
-	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", "REFRESH_OLD", fc)
+	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", fc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -578,7 +577,7 @@ func TestCacheRefreshedToken_ExtraNotString_NoOp(t *testing.T) {
 		map[string]interface{}{"id_token": 123}, // not a string → type assertion fails
 	)
 
-	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", "REFRESH_OLD", fc)
+	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", fc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -593,7 +592,7 @@ func TestCacheRefreshedToken_SetError_StopsEarly(t *testing.T) {
 	fc := &fakeCache{errOnSet: errors.New("boom")}
 	tok := tokenWithExtra("id_token", "NEW")
 
-	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", "REFRESH_OLD", fc)
+	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", fc)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -607,7 +606,7 @@ func TestCacheRefreshedToken_SetWithTTLError_Propagates(t *testing.T) {
 	fc := &fakeCache{errOnSetWithTTL: errors.New("late-boom")}
 	tok := tokenWithExtra("id_token", "NEW")
 
-	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", "REFRESH_OLD", fc)
+	err := auth.CacheRefreshedToken(tok, "id_token", "OLD", fc)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -733,10 +732,24 @@ func TestGetNewToken_Success(t *testing.T) {
 	}
 
 	call := fc.setWithTTLCalls[0]
-	if call.key != "oidc-token-OLD" || call.val != "REFRESH_OLD" || call.ttl != 10*time.Second {
-		t.Fatalf("SetWithTTL = {%q,%v,%v}, want {%q,%q,%v}",
-			call.key, call.val, call.ttl, "oidc-token-OLD", "REFRESH_OLD", 10*time.Second)
-	}
+	assert.Equal(t, "oidc-token-OLD", call.key)
+	assert.Same(t, newTok, call.val)
+	assert.Equal(t, 10*time.Second, call.ttl)
+}
+
+func TestGetNewTokenReusesRecentRefreshResult(t *testing.T) {
+	cached := (&oauth2.Token{AccessToken: "AT", RefreshToken: refreshNew}).WithExtra(map[string]interface{}{
+		"id_token": "NEW",
+	})
+	fc := &fakeCache{store: map[string]interface{}{"oidc-token-OLD": cached}}
+
+	token, err := auth.GetNewToken(
+		"cid", "secret", fc, "id_token", "OLD", "http://127.0.0.1:1", context.Background(),
+	)
+	require.NoError(t, err)
+	assert.Same(t, cached, token)
+	assert.Empty(t, fc.setCalls)
+	assert.Empty(t, fc.setWithTTLCalls)
 }
 
 func TestGetNewToken_PreHTTPFailures(t *testing.T) {
@@ -848,7 +861,7 @@ func TestRefreshAndCacheNewToken_Success(t *testing.T) {
 
 	require.Len(t, fc.setWithTTLCalls, 1)
 	assert.Equal(t, oldKey, fc.setWithTTLCalls[0].key)
-	assert.Equal(t, "REFRESH_OLD", fc.setWithTTLCalls[0].val)
+	assert.Same(t, tok, fc.setWithTTLCalls[0].val)
 	assert.Equal(t, 10*time.Second, fc.setWithTTLCalls[0].ttl)
 }
 
@@ -934,7 +947,7 @@ func TestRefreshAndSetToken_DefaultsToIDToken(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/"+cluster, nil)
 	rr := httptest.NewRecorder()
 
-	auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
+	err := auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
 		Ctx:              context.Background(),
 		OIDCAuthConfig:   &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret", IdpIssuerURL: srv.URL},
 		Cache:            fc,
@@ -946,6 +959,7 @@ func TestRefreshAndSetToken_DefaultsToIDToken(t *testing.T) {
 		OIDCIdpIssuerURL: "",
 		BaseURL:          "",
 	})
+	require.NoError(t, err)
 
 	resp := rr.Result()
 
@@ -984,7 +998,7 @@ func TestRefreshAndSetToken_UsesAccessToken(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/"+cluster, nil)
 	rr := httptest.NewRecorder()
 
-	auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
+	err := auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
 		Ctx:                context.Background(),
 		OIDCAuthConfig:     &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"},
 		Cache:              fc,
@@ -997,6 +1011,7 @@ func TestRefreshAndSetToken_UsesAccessToken(t *testing.T) {
 		OIDCIdpIssuerURL:   srv.URL,
 		BaseURL:            "",
 	})
+	require.NoError(t, err)
 
 	resp := rr.Result()
 
@@ -1022,7 +1037,7 @@ func TestRefreshAndSetToken_ErrorDoesNotSetCookie(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/"+cluster, nil)
 	rr := httptest.NewRecorder()
 
-	auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
+	err := auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
 		Ctx:              context.Background(),
 		OIDCAuthConfig:   &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"},
 		Cache:            fc,
@@ -1034,6 +1049,7 @@ func TestRefreshAndSetToken_ErrorDoesNotSetCookie(t *testing.T) {
 		OIDCIdpIssuerURL: srv.URL,
 		BaseURL:          "",
 	})
+	require.Error(t, err)
 
 	resp := rr.Result()
 
@@ -1041,6 +1057,79 @@ func TestRefreshAndSetToken_ErrorDoesNotSetCookie(t *testing.T) {
 
 	_, ok := findAuthCookie(resp, cluster)
 	assert.False(t, ok, "expected no auth cookie to be set on error")
+}
+
+func TestRefreshAndSetTokenCoalescesConcurrentRefreshes(t *testing.T) {
+	const oldToken = "OLD"
+
+	fc := &fakeCache{store: map[string]interface{}{"oidc-token-" + oldToken: "REFRESH_OLD"}}
+	requests := make(chan struct{}, 2)
+	release := make(chan struct{})
+	srv := newOIDCProviderServer(t, "", func(w http.ResponseWriter, _ *http.Request) {
+		requests <- struct{}{}
+
+		<-release
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(oauthSuccessBody))
+	})
+
+	coordinator := &auth.TokenRefreshCoordinator{}
+	results := make(chan error, 2)
+
+	var waitGroup sync.WaitGroup
+
+	for range 2 {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+
+			results <- refreshTokenForTest(fc, coordinator, oldToken, srv.URL)
+		}()
+	}
+
+	<-requests
+
+	duplicateRequest := false
+
+	select {
+	case <-requests:
+		duplicateRequest = true
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	waitGroup.Wait()
+	close(results)
+
+	assert.False(t, duplicateRequest, "expected one refresh-token exchange")
+
+	for err := range results {
+		require.NoError(t, err)
+	}
+}
+
+func refreshTokenForTest(
+	fc cache.Cache[interface{}],
+	coordinator *auth.TokenRefreshCoordinator,
+	oldToken string,
+	issuerURL string,
+) error {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/test", nil)
+
+	return auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
+		Ctx:              context.Background(),
+		OIDCAuthConfig:   &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"},
+		Cache:            fc,
+		Token:            oldToken,
+		Cluster:          "test",
+		Writer:           recorder,
+		Request:          request,
+		TelemetryHandler: &telemetry.RequestHandler{},
+		OIDCIdpIssuerURL: issuerURL,
+		Coordinator:      coordinator,
+	})
 }
 
 // TestConfigureTLSContext_NoConfig tests when both skipTLSVerify and caCert are not set.

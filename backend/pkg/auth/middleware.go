@@ -68,6 +68,8 @@ func SetTokenFromCookie(r *http.Request, clusterName string) {
 //
 //nolint:funlen
 func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Handler) http.Handler {
+	refreshCoordinator := &TokenRefreshCoordinator{}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
@@ -131,7 +133,7 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 				return
 			}
 
-			RefreshAndSetToken(RefreshAndSetTokenParams{
+			err = RefreshAndSetToken(RefreshAndSetTokenParams{
 				Ctx:                       ctx,
 				OIDCAuthConfig:            oidcAuthConfig,
 				Cache:                     config.Cache,
@@ -146,7 +148,26 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 				OIDCValidatorIdpIssuerURL: config.OidcValidatorIdpIssuerURL,
 				BaseURL:                   config.BaseURL,
 				SessionTTL:                config.SessionTTL,
+				Coordinator:               refreshCoordinator,
 			})
+			if err != nil {
+				status = "token_refresh_failure"
+
+				ClearTokenCookie(w, r, cluster, config.BaseURL)
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+
+				if _, writeErr := w.Write([]byte(
+					`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",` +
+						`"message":"authentication session expired","reason":"Unauthorized","code":401}`,
+				)); writeErr != nil {
+					logger.Log(logger.LevelError, map[string]string{"cluster": cluster},
+						writeErr, "writing expired authentication response")
+				}
+
+				return
+			}
 
 			next.ServeHTTP(w, r)
 		})

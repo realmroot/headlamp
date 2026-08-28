@@ -21,12 +21,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewOIDCTokenRefreshMiddleware(t *testing.T) {
@@ -54,6 +56,66 @@ func TestNewOIDCTokenRefreshMiddleware(t *testing.T) {
 	rec = httptest.NewRecorder()
 	middleware.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestOIDCTokenRefreshFailureEndsExpiredSession(t *testing.T) {
+	clusterName := "inventory-cluster"
+	token := makeJWTWithPayload(t, map[string]interface{}{
+		"exp": float64(time.Now().Add(-time.Minute).Unix()),
+	})
+	oidcServer := newOIDCProviderServer(t, "", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "token endpoint must not be reached", http.StatusInternalServerError)
+	})
+
+	kubeConfigStore := kubeconfig.NewContextStore()
+	require.NoError(t, kubeConfigStore.AddContext(&kubeconfig.Context{
+		Name: clusterName,
+		OidcConf: &kubeconfig.OidcConfig{
+			ClientID:     "client",
+			IdpIssuerURL: oidcServer.URL,
+		},
+	}))
+	config := auth.OIDCTokenRefreshConfig{
+		KubeConfigStore:  kubeConfigStore,
+		Cache:            cache.New[interface{}](),
+		TelemetryHandler: &telemetry.RequestHandler{},
+	}
+	nextCalled := false
+	middleware := auth.NewOIDCTokenRefreshMiddleware(config)(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		nextCalled = true
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodGet,
+		"/clusters/"+clusterName+"/api/v1/pods",
+		nil,
+	)
+	req.AddCookie(&http.Cookie{
+		Name:     "headlamp-auth-" + auth.SanitizeClusterName(clusterName) + ".0",
+		Value:    token,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	recorder := httptest.NewRecorder()
+
+	middleware.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	assert.False(t, nextCalled)
+	assert.Contains(t, recorder.Header().Get("Set-Cookie"), "Max-Age=0")
+	assert.Equal(t, "application/json", recorder.Header().Get("Content-Type"))
+	assert.JSONEq(t,
+		`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure",`+
+			`"message":"authentication session expired","reason":"Unauthorized","code":401}`,
+		recorder.Body.String(),
+	)
 }
 
 func TestSetTokenFromCookie(t *testing.T) {
