@@ -28,6 +28,7 @@ import (
 	"hash"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -65,6 +66,7 @@ const (
 	storeRootPrefix               = "store/"
 
 	clusterExecConfigExtensionKey = "client.authentication.k8s.io/exec"
+	credentialSourceOIDC          = "oidc"
 )
 
 // Structured-log field names that recur across many log sites.
@@ -98,6 +100,9 @@ type Options struct {
 	HubNamespace string
 	// DiscoverFromStore enables discovery from non-internal contexts already in Store.
 	DiscoverFromStore bool
+	// OIDCConfig is inherited by discovered contexts whose provider selects the
+	// OIDC credential source.
+	OIDCConfig *kubeconfig.OidcConfig
 }
 
 // Runner watches ClusterProfile resources and syncs them into Headlamp's context store.
@@ -111,6 +116,8 @@ type Runner struct {
 	hubConfig             *rest.Config
 	hubNamespace          string
 	discoverFromStore     bool
+	oidcConfig            *kubeconfig.OidcConfig
+	oidcProviders         map[string]struct{}
 
 	clientForConfig func(*rest.Config) (ciaclient.Interface, error)
 	now             func() time.Time
@@ -160,9 +167,9 @@ func NewRunner(opts Options) (*Runner, error) {
 		return nil, errors.New("cluster inventory provider file is required")
 	}
 
-	accessConfig, err := access.NewFromFile(opts.ProviderFile)
+	accessConfig, oidcProviders, err := loadProviderConfiguration(opts.ProviderFile, opts.OIDCConfig != nil)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster inventory provider file: %w", err)
+		return nil, err
 	}
 
 	labelSelector, err := normalizeLabelSelector(opts.LabelSelector)
@@ -195,6 +202,8 @@ func NewRunner(opts Options) (*Runner, error) {
 		hubConfig:             opts.HubConfig,
 		hubNamespace:          opts.HubNamespace,
 		discoverFromStore:     opts.DiscoverFromStore,
+		oidcConfig:            copyOIDCConfig(opts.OIDCConfig),
+		oidcProviders:         oidcProviders,
 		clientForConfig: func(config *rest.Config) (ciaclient.Interface, error) {
 			return ciaclient.NewForConfig(config)
 		},
@@ -204,6 +213,24 @@ func NewRunner(opts Options) (*Runner, error) {
 		profileKeysByRoot: map[string]map[string]string{},
 		noCRD:             map[string]time.Time{},
 	}, nil
+}
+
+func loadProviderConfiguration(path string, oidcConfigured bool) (*access.Config, map[string]struct{}, error) {
+	accessConfig, err := access.NewFromFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load cluster inventory provider file: %w", err)
+	}
+
+	oidcProviders, err := loadOIDCCredentialProviders(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load cluster inventory credential sources: %w", err)
+	}
+
+	if len(oidcProviders) > 0 && !oidcConfigured {
+		return nil, nil, errors.New("cluster inventory OIDC credential source requires Headlamp OIDC configuration")
+	}
+
+	return accessConfig, oidcProviders, nil
 }
 
 // Run blocks until ctx is cancelled and reconciles long-lived root informers.
@@ -598,7 +625,7 @@ func (r *Runner) contextFromClusterProfile(
 		return nil, false
 	}
 
-	restConfig, err := copyAccessConfig(r.accessConfig).BuildConfigFromCP(accessOnlyClusterProfile(cp))
+	restConfig, err := r.restConfigFromClusterProfile(cp)
 	if err != nil {
 		logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
 			"cluster-inventory: failed to build rest config")
@@ -608,7 +635,7 @@ func (r *Runner) contextFromClusterProfile(
 
 	contextName := contextNameFromProfileKey(profileKey)
 
-	headlampContext, err := restConfigToContext(restConfig, contextName, profileKey)
+	headlampContext, err := restConfigToContext(restConfig, contextName, profileKey, r.oidcConfig)
 	if err != nil {
 		logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
 			"cluster-inventory: failed to convert rest config")
@@ -626,6 +653,101 @@ func (r *Runner) contextFromClusterProfile(
 	headlampContext.ClusterInventory = clusterInventoryMetadataFromProfile(profileKey, cp)
 
 	return headlampContext, true
+}
+
+// restConfigFromClusterProfile resolves an SDK exec provider or an explicitly
+// configured OIDC credential source.
+func (r *Runner) restConfigFromClusterProfile(cp *apisv1alpha1.ClusterProfile) (*rest.Config, error) {
+	accessConfig := copyAccessConfig(r.accessConfig)
+
+	restConfig, err := accessConfig.BuildConfigFromCP(accessOnlyClusterProfile(cp))
+	if err == nil {
+		return restConfig, nil
+	}
+
+	if len(r.oidcProviders) == 0 {
+		return nil, err
+	}
+
+	accessProviders := make(map[string]apisv1alpha1.AccessProvider, len(cp.Status.AccessProviders))
+	for _, provider := range cp.Status.AccessProviders {
+		accessProviders[provider.Name] = provider
+	}
+
+	for providerName := range r.oidcProviders {
+		provider, ok := accessProviders[providerName]
+		if !ok {
+			continue
+		}
+
+		server, parseErr := url.Parse(provider.Cluster.Server)
+		if parseErr != nil || server.Host == "" || (server.Scheme != "https" && server.Scheme != "http") {
+			return nil, fmt.Errorf("OIDC provider %q has an invalid server URL", providerName)
+		}
+
+		result := &rest.Config{
+			Host: provider.Cluster.Server,
+			TLSClientConfig: rest.TLSClientConfig{
+				CAData:   append([]byte(nil), provider.Cluster.CertificateAuthorityData...),
+				Insecure: provider.Cluster.InsecureSkipTLSVerify,
+			},
+		}
+		if provider.Cluster.ProxyURL != "" {
+			proxyURL, proxyErr := url.Parse(provider.Cluster.ProxyURL)
+			if proxyErr != nil || proxyURL.Host == "" {
+				return nil, fmt.Errorf("OIDC provider %q has an invalid proxy URL", providerName)
+			}
+
+			result.Proxy = http.ProxyURL(proxyURL)
+		}
+
+		return result, nil
+	}
+
+	return nil, err
+}
+
+type providerCredentialConfig struct {
+	Name             string          `json:"name"`
+	ExecConfig       *api.ExecConfig `json:"execConfig"`
+	CredentialSource string          `json:"credentialSource,omitempty"`
+}
+
+type providerFileConfig struct {
+	Providers []providerCredentialConfig `json:"providers"`
+}
+
+func loadOIDCCredentialProviders(path string) (map[string]struct{}, error) {
+	// #nosec G304 -- path is the operator-configured provider file already read by the Cluster Inventory SDK.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var config providerFileConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	providers := make(map[string]struct{})
+
+	for _, provider := range config.Providers {
+		switch provider.CredentialSource {
+		case "":
+			continue
+		case credentialSourceOIDC:
+			if provider.ExecConfig != nil {
+				return nil, fmt.Errorf("provider %q cannot configure both credentialSource and execConfig", provider.Name)
+			}
+
+			providers[provider.Name] = struct{}{}
+		default:
+			return nil, fmt.Errorf("provider %q has unsupported credentialSource %q", provider.Name,
+				provider.CredentialSource)
+		}
+	}
+
+	return providers, nil
 }
 
 // clusterInventoryMetadataFromProfile copies non-sensitive ClusterProfile status metadata.
@@ -1345,7 +1467,12 @@ func proxyURLFromRestConfig(restConfig *rest.Config) (string, error) {
 }
 
 // restConfigToContext builds a Headlamp kubeconfig.Context from a generated rest.Config.
-func restConfigToContext(restConfig *rest.Config, contextName, profileKey string) (*kubeconfig.Context, error) {
+func restConfigToContext(
+	restConfig *rest.Config,
+	contextName string,
+	profileKey string,
+	oidcConfig *kubeconfig.OidcConfig,
+) (*kubeconfig.Context, error) {
 	if restConfig == nil {
 		return nil, errors.New("restConfig is nil")
 	}
@@ -1400,5 +1527,28 @@ func restConfigToContext(restConfig *rest.Config, contextName, profileKey string
 		Source:         kubeconfig.ClusterInventory,
 		KubeConfigPath: "",
 		ClusterID:      clusterInventoryIDPrefix + profileKey,
+		OidcConf:       copyOIDCConfig(oidcConfig),
 	}, nil
+}
+
+func copyOIDCConfig(source *kubeconfig.OidcConfig) *kubeconfig.OidcConfig {
+	if source == nil {
+		return nil
+	}
+
+	copied := &kubeconfig.OidcConfig{
+		ClientID: source.ClientID, ClientSecret: source.ClientSecret,
+		IdpIssuerURL: source.IdpIssuerURL, Scopes: append([]string(nil), source.Scopes...),
+	}
+	if source.SkipTLSVerify != nil {
+		value := *source.SkipTLSVerify
+		copied.SkipTLSVerify = &value
+	}
+
+	if source.CACert != nil {
+		value := *source.CACert
+		copied.CACert = &value
+	}
+
+	return copied
 }
