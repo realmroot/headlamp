@@ -1432,6 +1432,31 @@ func TestGetOrCreateConnectionDoesNotOverwriteServiceAccountToken(t *testing.T) 
 	assert.Equal(t, serviceAccountToken, *refreshedConn.Token)
 }
 
+func TestReplaceTokenUpdatesActiveUserConnections(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+	m := NewMultiplexer(store, false)
+
+	originalToken := "original-token"
+	otherToken := "other-token"
+	refreshedToken := "refreshed-token"
+	userConnection := m.createConnection("cluster", "user", "/api/v1/pods", "watch=true", nil, &originalToken)
+	otherConnection := m.createConnection("cluster", "other", "/api/v1/services", "watch=true", nil, &otherToken)
+	serviceAccountConnection := m.createConnection("cluster", "system", "/api/v1/nodes", "watch=true", nil, &originalToken)
+	serviceAccountConnection.usesServiceAccountToken = true
+	m.connections["user"] = userConnection
+	m.connections["other"] = otherConnection
+	m.connections["system"] = serviceAccountConnection
+
+	m.ReplaceToken(originalToken, refreshedToken)
+
+	require.NotNil(t, userConnection.Token)
+	assert.Equal(t, refreshedToken, *userConnection.Token)
+	require.NotNil(t, otherConnection.Token)
+	assert.Equal(t, otherToken, *otherConnection.Token)
+	require.NotNil(t, serviceAccountConnection.Token)
+	assert.Equal(t, originalToken, *serviceAccountConnection.Token)
+}
+
 func TestReconnect_WithToken(t *testing.T) {
 	store := kubeconfig.NewContextStore()
 	m := NewMultiplexer(store, false)

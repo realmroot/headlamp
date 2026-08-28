@@ -600,6 +600,7 @@ type RefreshAndSetTokenParams struct {
 	BaseURL                   string
 	SessionTTL                int
 	Coordinator               *TokenRefreshCoordinator
+	OnTokenRefreshed          func(oldToken, newToken string)
 }
 
 // TokenRefreshCoordinator coalesces refreshes for requests carrying the same
@@ -669,6 +670,10 @@ func RefreshAndSetToken(params RefreshAndSetTokenParams) error {
 	}
 
 	SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
+
+	if params.OnTokenRefreshed != nil {
+		params.OnTokenRefreshed(params.Token, newTokenString)
+	}
 
 	params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
 

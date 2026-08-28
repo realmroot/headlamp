@@ -1410,6 +1410,11 @@ func applyRequestTokenToContext(r *http.Request, clusterName string, context *ku
 // The middleware logic was relocated to the auth package to keep authentication
 // concerns together.
 func (c *HeadlampConfig) OIDCTokenRefreshMiddleware(next http.Handler) http.Handler {
+	var onTokenRefreshed func(oldToken, newToken string)
+	if c.Multiplexer != nil {
+		onTokenRefreshed = c.Multiplexer.ReplaceToken
+	}
+
 	config := auth.OIDCTokenRefreshConfig{
 		KubeConfigStore:              c.KubeConfigStore,
 		Cache:                        c.Cache,
@@ -1423,6 +1428,7 @@ func (c *HeadlampConfig) OIDCTokenRefreshMiddleware(next http.Handler) http.Hand
 		SessionTTL:                   c.SessionTTL,
 		UseInCluster:                 c.UseInCluster,
 		UnsafeUseServiceAccountToken: c.UnsafeUseServiceAccountToken,
+		OnTokenRefreshed:             onTokenRefreshed,
 	}
 
 	return auth.NewOIDCTokenRefreshMiddleware(config)(next)

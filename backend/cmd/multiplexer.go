@@ -224,6 +224,35 @@ func NewMultiplexer(kubeConfigStore kubeconfig.ContextStore, unsafeUseServiceAcc
 	}
 }
 
+// ReplaceToken keeps long-lived watch connections aligned with a token that
+// was refreshed through the HTTP authentication middleware. Existing upstream
+// sockets remain valid until they close; subsequent reconnects use the new
+// token instead of replaying the expired credential captured at WebSocket
+// establishment time.
+func (m *Multiplexer) ReplaceToken(oldToken, newToken string) {
+	if oldToken == "" || newToken == "" || oldToken == newToken {
+		return
+	}
+
+	m.mutex.RLock()
+
+	connections := make([]*Connection, 0, len(m.connections))
+	for _, conn := range m.connections {
+		connections = append(connections, conn)
+	}
+
+	m.mutex.RUnlock()
+
+	for _, conn := range connections {
+		conn.mu.Lock()
+		if !conn.usesServiceAccountToken && conn.Token != nil && *conn.Token == oldToken {
+			refreshedToken := newToken
+			conn.Token = &refreshedToken
+		}
+		conn.mu.Unlock()
+	}
+}
+
 // readServiceAccountToken reads the service account token from path, caching the value
 // per path and refreshing it when the file's mtime changes (e.g. kubelet token rotation).
 func (m *Multiplexer) readServiceAccountToken(path string) (string, error) {
@@ -591,13 +620,23 @@ func (m *Multiplexer) reconnect(conn *Connection) (*Connection, error) {
 		_ = conn.WSConn.Close()
 	}
 
+	conn.mu.RLock()
+
+	token := conn.Token
+	if token != nil {
+		value := *token
+		token = &value
+	}
+
+	conn.mu.RUnlock()
+
 	newConn, err := m.establishClusterConnection(
 		conn.ClusterID,
 		conn.UserID,
 		conn.Path,
 		conn.Query,
 		conn.Client,
-		conn.Token,
+		token,
 	)
 	if err != nil {
 		logger.Log(logger.LevelError, map[string]string{logFieldClusterID: conn.ClusterID}, err, "reconnecting to cluster")
